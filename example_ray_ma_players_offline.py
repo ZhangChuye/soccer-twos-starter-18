@@ -11,7 +11,7 @@ NUM_ENVS_PER_WORKER = 3
 
 
 if __name__ == "__main__":
-    ray.init()
+    ray.init(include_dashboard=False)
 
     tune.registry.register_env("Soccer", create_rllib_env)
     temp_env = create_rllib_env(

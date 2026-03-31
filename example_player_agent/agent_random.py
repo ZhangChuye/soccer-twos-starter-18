@@ -16,7 +16,7 @@ class RandomAgent(AgentInterface):
             env: the competition environment.
         """
         super().__init__()
-
+        self.name = "SoccerRandom"
         self.action_space = env.action_space
 
     def act(self, observation: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
