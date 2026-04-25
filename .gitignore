@@ -2,6 +2,7 @@ envs/
 ray_results/
 ceia_baseline_agent/
 data/
+.curriculum_stage
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -135,3 +136,12 @@ dmypy.json
 
 reward_shaped_agent/
 selfplay_agent/
+
+*.zip
+
+LUCKETS_AGENT/
+Luckets_agent/
+Luckets_agent_old/
+curriculum_agent/
+final_selfplay copy/
+final_selfplay/

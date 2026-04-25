@@ -1,6 +1,10 @@
 """
 Copy a Ray checkpoint into an agent package directory.
 
+All artifacts are written to ``<agent_dir>/checkpoint/`` (Ray ``checkpoint-*``,
+``params.pkl``, etc.). Agent code should load from that subfolder, same as
+``final_selfplay/checkpoint/`` and ``curriculum_agent/checkpoint/``.
+
 Usage:
     python package_agent.py <checkpoint_path> [agent_dir]
 
