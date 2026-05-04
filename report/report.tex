@@ -24,7 +24,12 @@
 \maketitle
 
 \begin{abstract}
-We apply delta-based reward shaping and a four-stage opponent curriculum to PPO in the SoccerTwos environment. Reward shaping alone bootstraps learning within $0.25$M steps and reaches $8/10$ wins versus the CEIA baseline; our submitted agent LUCKETS\_AGENT adds a redesigned four-stage curriculum (trained over a stitched $35.8$M-step three-segment chain) and beats the shaping-only variant $7/10$ in head-to-head play. Pure PPO self-play without shaping scores \emph{zero} goals in $10$ matches, confirming that the reward signal---not the self-play structure---is the primary bottleneck. We also report a first-attempt curriculum that failed to advance past Stage~$0$ due to an opponent-policy mapping bug, which directly motivated the redesign.
+We study PPO in SoccerTwos, where the sparse goal reward makes early learning very slow.
+Adding a small delta-based shaping signal was enough to get the agent to start learning: against a frozen random opponent, win rate crossed $0.9$ within $0.25$M environment steps, and the resulting policy won $8$ of $10$ matches against the CEIA baseline.
+We then added an opponent curriculum to push the agent further.
+Our submitted agent, LUCKETS\_AGENT, was trained for $35.8$M steps across three resumed segments, and beat the shaping-only agent $7$ of $10$ matches head-to-head.
+We also report a curriculum attempt that failed: the win rate climbed to $0.99$ but the curriculum never left Stage~$0$, because the opponent's weights were not actually swapped in the Ray workers.
+Diagnosing this is what led to the final design.
 \end{abstract}
 
 \begin{center}
@@ -38,61 +43,111 @@ We apply delta-based reward shaping and a four-stage opponent curriculum to PPO 
 %===============================================================================
 \section{Overview}
 
-Raw PPO on SoccerTwos faces two obstacles: (i) goals are rare, so the sparse $\pm 1$ reward gives almost no gradient signal in early training; and (ii) a self-play opponent that is always ``yourself'' produces a non-stationary target that offers little stable learning signal once both sides converge on a trivial strategy.
-We address (i) with small delta-based dense reward terms that fire on every step without changing the optimal policy, and (ii) with a four-stage opponent curriculum that starts against a random opponent and gradually escalates to the CEIA baseline and then self-play~\citep{Bengio2009Curriculum}.
-We run three configurations---reward shaping only, pure sparse self-play, and the combined agent---to isolate each contribution.
+SoccerTwos is hard for two reasons.
+First, only goals score, so reward is very sparse: the agent can take millions of steps before it sees a single non-zero return, and most PPO updates carry almost no useful signal.
+Second, self-play has no fixed training target.
+If both teams converge on a trivial idle strategy, neither side has any reason to break the deadlock.
+
+We test two ideas in response.
+Reward shaping addresses the sparsity problem by adding a small dense signal that fires every step.
+An opponent curriculum addresses the non-stationarity problem by gradually shifting the training distribution, from a random opponent toward the course-provided CEIA baseline, and finally toward frozen snapshots of the agent itself~\citep{Bengio2009Curriculum}.
+We ran four training configurations to isolate the contribution of each idea: a sparse self-play baseline, reward shaping against a random opponent, a curriculum design that we initially got wrong, and the redesigned curriculum that produced the submitted agent.
 
 %===============================================================================
 \section{Method}
 \label{sec:method}
 
 \textbf{Algorithm and library.}
-All runs use Ray RLlib~\citep{Liang2018RLlib} with the PPO trainer~\citep{Schulman2017PPO} (Ray 1.4.0, PyTorch, two-layer MLP $[256,256]$, ReLU). Hyperparameters: Appendix~\ref{sec:hp}.
+All runs use Ray RLlib~\citep{Liang2018RLlib} with the PPO trainer~\citep{Schulman2017PPO} (Ray 1.4.0, PyTorch backend).
+The policy and value networks share a two-layer $[256,256]$ ReLU MLP trunk.
+Full hyperparameters are listed in Appendix~\ref{sec:hp}.
 
 \textbf{Reward modification.}
-The default environment returns $\pm 1$ only at goals plus a small per-step penalty. We wrap it with \texttt{RewardShaperWrapper} (\texttt{utils.py}) which adds two dense terms each step:
+The default environment returns $\pm 1$ only at goals, plus a small per-step penalty.
+We wrap it with \texttt{RewardShaperWrapper} (\texttt{utils.py}), which adds two small dense rewards on every step.
+The first rewards the agent for getting closer to the ball.
+The second rewards the team whenever the ball moves toward the opponent's goal.
+
+We use \emph{changes} in distance and ball position rather than the absolute values.
+This matters: an absolute distance reward penalises an agent for resting away from the ball, even when standing back is the right thing to do, and the policy ends up chasing the ball instead of positioning.
+The delta form only rewards the agent when it actually approaches the ball, and only rewards the team when the ball actually moves forward.
+Concretely:
 \begin{equation}
 r^{\text{prox}}_t(i) = \alpha_{\text{prox}}\bigl(d_{t-1}(i)-d_t(i)\bigr), \qquad
 r^{\text{prog}}_t(i) = \alpha_{\text{prog}}\bigl(x^{\text{ball}}_t - x^{\text{ball}}_{t-1}\bigr)\,\mathrm{sign}(\mathrm{team}(i))
 \label{eq:shaping}
 \end{equation}
-where $d_t(i)=\lVert p^{\text{player}}_t(i)-p^{\text{ball}}_t\rVert_2$ and $x^{\text{ball}}$ is the ball's forward coordinate; $\alpha_{\text{prox}}{=}0.02$, $\alpha_{\text{prog}}{=}0.05$.
-Both terms are \emph{deltas}: agents are rewarded only for \emph{approaching} the ball and \emph{moving} it toward the opponent goal, not for already being close---so the shaping is nearly potential-based~\citep{Ng1999RewardShaping}, preserving the optimal policy.
-\textit{Motivation:} the sparse goal reward fires on $<\!1\%$ of steps, so PPO's gradient is dominated by advantage variance; per-step deltas bootstrap the agent past the ``nothing happens'' phase efficiently.
+where $d_t(i)=\lVert p^{\text{player}}_t(i)-p^{\text{ball}}_t\rVert_2$ and $x^{\text{ball}}$ is the ball's forward coordinate.
+We set $\alpha_{\text{prox}}{=}0.02$ and $\alpha_{\text{prog}}{=}0.05$, so progress dominates proximity: pushing the ball forward is always preferred to chasing it.
+Both terms are nearly potential-based~\citep{Ng1999RewardShaping}, so they bias the agent toward useful behaviour without changing the optimal policy in expectation.
 
-\textbf{Opponent curriculum (LUCKETS\_AGENT).}
-A \texttt{CurriculumCallback} remaps orange-team policies in four stages: \emph{(0)~Random:} both $\to$ \texttt{opp\_rand}; \emph{(1)~Hybrid:} agent~2 $\to$ \texttt{opp\_base} (CEIA), agent~3 $\to$ \texttt{opp\_rand}; \emph{(2)~Baseline:} both $\to$ \texttt{opp\_base}; \emph{(3)~Self-play:} both $\to$ \texttt{opp\_self} (frozen learner snapshot).
-Promotion requires win rate $\ge 0.80$ for $3$ consecutive iterations.
-The current stage is persisted to \texttt{.curriculum\_stage} and read by every Ray worker on each rollout.
-\textit{Motivation:} a policy trained only against a random opponent has a narrow occupancy distribution; directly switching to the CEIA baseline collapses training. The ramp keeps the learning problem just difficult enough to make progress at each stage.
+\textbf{Opponent curriculum.}
+The curriculum changes who the agent plays against during training, in four stages.
+Stage~0 uses two random-weight opponents (\texttt{opp\_rand}), so the agent first learns the basic mechanics of approaching and shooting the ball.
+Stage~1 mixes one random opponent with one CEIA baseline player (\texttt{opp\_base}), so the policy starts seeing structured defense without facing it on both sides at once.
+Stage~2 replaces both opponents with the CEIA baseline.
+Stage~3 plays the agent against frozen snapshots of itself (\texttt{opp\_self}), where the opponent grows together with the policy.
+Promotion is gated on the training win rate: the agent advances when it wins at least $80\%$ of episodes for three consecutive iterations.
+
+We see the curriculum as a way of slowly extending the training distribution.
+A policy trained only against random opponents converges to a narrow set of states; large parts of the CEIA opponent's behaviour are off-distribution for it.
+Each stage shifts the training distribution toward stronger play without making the learning problem too hard at any one step.
+The current stage is written to a \texttt{.curriculum\_stage} file that every Ray worker re-reads on each rollout, so the orange-team policy assignment stays consistent across processes.
 
 %===============================================================================
 \section{Experimental Results}
 \label{sec:result}
 
-\textbf{Exploration path} (Fig.~\ref{fig:training}).
-\emph{Phase~1 (Agent~2):} sparse PPO self-play (\texttt{67194}, $2.4$M steps) scored zero goals.
-\emph{Phase~2 (Agent~1):} adding shaping vs.\ a frozen random opponent (\texttt{a6c6d}, $10$M steps) crossed $0.9$ win rate at $0.25$M and reached $8/10$ vs.\ CEIA.
-\emph{Phase~3:} a first-attempt curriculum with a single shared \texttt{opponent} policy (\texttt{7b8e4}, $15$M steps) hit $0.99$ win rate but stayed at Stage~$0$ throughout---our promotion gate fired but the single-policy design could not be remapped at runtime in RLlib's worker config.
-\emph{Phase~4 (LUCKETS\_AGENT):} we redesigned the curriculum with three separate opponent policies (\texttt{opp\_rand}, \texttt{opp\_base}, \texttt{opp\_self}) selected by \texttt{policy\_mapping\_fn} from a stage file persisted across Ray workers, and trained three resumed segments: Stage~$0\!\to\!1$ ($0\!-\!15$M, \texttt{c33b8}), Stage~$1\!\to\!2$ ($15\!-\!20.8$M, \texttt{6eb9a}), Stage~$2\!\to\!3$ ($20.8\!-\!35.8$M, \texttt{02fdb}). \texttt{checkpoint-600} of \texttt{02fdb} ships as LUCKETS\_AGENT.
+We ran four training configurations.
+Together they trace the path that produced LUCKETS\_AGENT.
+Figure~\ref{fig:training} shows the corresponding training curves.
+
+\textbf{Phase~1: sparse self-play.}
+Our first run was a sanity check.
+We trained PPO with three rotating frozen-snapshot opponents and the original sparse reward (run \texttt{67194}, $2.4$M steps).
+The agent never scored a goal in any of the $10$ evaluation matches, against either the example player or the CEIA baseline.
+This was the first sign that sparse reward, not the self-play structure, was the main thing to fix.
+
+\textbf{Phase~2: reward shaping vs.\ a random opponent.}
+We then added the delta-based shaping wrapper and froze the orange team to a random-weight opponent (run \texttt{a6c6d}, $10$M steps).
+Win rate crossed $0.9$ by about $0.25$M steps and stayed near $1.0$ for the rest of training.
+In evaluation, this agent won $10/10$ against the example player and $8/10$ against the CEIA baseline.
+The contrast with Phase~1 was the clearest evidence we had that reward shaping---not anything about the self-play setup---was the dominant factor.
+
+\textbf{Phase~3: a curriculum that did not work.}
+We then wrote a curriculum scheduler around a single shared \texttt{opponent} policy that we intended to remap between random, baseline, and self-play (run \texttt{7b8e4}, $15$M steps).
+At first the run looked correct: win rate climbed to $0.99$ and the promotion rule fired repeatedly, but the curriculum stage indicator never moved past $0$.
+The cause was that replacing a shared policy's weights at runtime requires updating every Ray worker's local config, while our callback only mutated the driver's copy.
+The opponent never actually changed, so the agent was simply learning to dominate a random-init policy more thoroughly.
+
+\textbf{Phase~4: the redesigned curriculum (LUCKETS\_AGENT).}
+We rebuilt the curriculum to declare three separate opponent policies up front (\texttt{opp\_rand}, \texttt{opp\_base}, \texttt{opp\_self}) and select between them in \texttt{policy\_mapping\_fn} based on the stage file, so weight swaps stay consistent across workers.
+Training was split into three resumed segments because of cluster-time limits, with the stage state and checkpoint carrying across each resume:
+segment~1 (\texttt{c33b8}, $0\!-\!15$M) covers Stages~$0$ and~$1$;
+segment~2 (\texttt{6eb9a}, $15\!-\!20.8$M) advances through Stage~$2$;
+segment~3 (\texttt{02fdb}, $20.8\!-\!35.8$M) trains at Stage~$3$ against frozen learner snapshots.
+We submit \texttt{checkpoint-600} of segment~3 as LUCKETS\_AGENT.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\textwidth]{fig_training_all.png}
-\caption{\textbf{Training curves for all four experiments.}
-(a)~\emph{Phase~1, sparse self-play} (\texttt{67194}, $2.4$M steps): episode reward never crosses $0$.
-(b)~\emph{Phase~2, reward shaping vs.\ random} (\texttt{a6c6d}, $10$M steps): win rate $\ge\!0.9$ within $0.25$M steps, saturating near $1.0$.
-(c)~\emph{Phase~3, curriculum~v1 — failed} (\texttt{7b8e4}, $15$M steps): win rate climbs but \emph{curriculum stage remains 0 throughout} (right axis) because the single-opponent design cannot swap weights at runtime.
-(d)~\emph{Phase~4, redesigned curriculum} (\texttt{c33b8 + 6eb9a + 02fdb}, $35.8$M steps stitched): colored backgrounds mark the four curriculum stages; black dashed verticals are the two segment resumes; red dotted is the $0.8$ promotion gate; grey dotted is the $0.5$ self-play symmetric ceiling.}
+\caption{Training curves for the four main experiments.
+(a)~Sparse self-play fails to score: episode reward never crosses $0$.
+(b)~Reward shaping against a random opponent quickly converges to a near-perfect win rate.
+(c)~The first curriculum attempt reaches a high win rate, but the stage indicator (right axis) never leaves $0$ -- this is the policy-mapping bug.
+(d)~The redesigned curriculum advances through all four stages across three resumed training segments (vertical dashed lines mark resumes; coloured backgrounds mark stages; red dotted is the $0.8$ promotion gate; grey dotted is the $0.5$ self-play ceiling).
+Run IDs: (a) \texttt{67194}; (b) \texttt{a6c6d}; (c) \texttt{7b8e4}; (d) \texttt{c33b8\,+\,6eb9a\,+\,02fdb}.}
 \label{fig:training}
 \end{figure}
 
 \textbf{Head-to-head evaluation.}
-We ran $10$ headless matches per pairing ($1{,}000$ step timeout, \texttt{explore=False}).
-Table~\ref{tab:eval} reports win/loss/draw from team~0's perspective.
-Agent~3 (LUCKETS) wins $8/10$ versus CEIA ($2$ losses, $0$ draws) and beats Agent~1 $7\text{-}1\text{-}2$.
-Agent~1 also wins $8/10$ versus CEIA but with $2$ draws instead of losses, indicating Agent~3 is more aggressive but occasionally over-commits.
-Agent~2 draws all $10$ matches against the example player and loses all $10$ to CEIA.
+We evaluated each agent in $10$ headless matches per pairing, using deterministic policies (\texttt{explore=False}) and a $1{,}000$-step timeout.
+Table~\ref{tab:eval} shows the records from the blue team's perspective.
+LUCKETS\_AGENT won $10/10$ against the example player and $8/10$ against the CEIA baseline; the two losses against CEIA were both shutouts.
+Against the shaping-only Agent~1, LUCKETS won $7$, lost $1$, and drew $2$.
+Agent~1 also won $8/10$ against CEIA, but with $2$ draws and no losses.
+The pattern is consistent: LUCKETS plays more aggressively, which wins more head-to-head matches but occasionally costs a goal against a strong defender, while Agent~1 is more conservative and tends to settle for draws.
+Agent~2 (sparse self-play) drew all $10$ of its matches against the example player and lost all $10$ to CEIA.
 
 \begin{table}[t]
 \centering
@@ -114,7 +169,7 @@ Each row is the blue team; column is the orange opponent.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=0.40\textwidth]{overall_figure.png}
+\includegraphics[width=0.34\textwidth]{overall_figure.png}
 \caption{\small LUCKETS\_AGENT (blue) vs.\ CEIA baseline (orange) during evaluation; score 5--1 mid-game.}
 \label{fig:game}
 \end{figure}
@@ -123,16 +178,38 @@ Each row is the blue team; column is the orange opponent.
 \section{Analysis and Discussion}
 \label{sec:analysis}
 
-\textbf{Reward shaping.} \emph{Result: higher reward and faster convergence.}
-With sparse reward, the policy gradient is dominated by variance because goal events fire on $<\!1\%$ of steps. The delta form of Eq.~\ref{eq:shaping} converts every step into a small informative signal without changing the optimal policy, and using \emph{deltas} (not absolute values) avoids the ball-chasing attractor an absolute-distance reward would create. This is why Agent~1 reaches $0.9$ win rate within $0.25$M steps while Agent~2 (sparse) never scores.
+\textbf{Reward shaping was the main reason PPO started learning at all.}
+With sparse reward, the agent almost never sees a goal event, so most policy-gradient updates carry little useful information.
+The delta rewards change this: the agent gets a small, informative signal whenever it moves closer to the ball or pushes the ball forward.
+Using deltas instead of absolute distance was important.
+An absolute-distance reward would penalise the agent for not standing on top of the ball, which we found in early experiments produces ball-chasing rather than positioning.
+The clearest evidence is the contrast between Phases~1 and~2: identical algorithm, similar step budget, but only the shaped agent learned to score.
 
-\textbf{Curriculum.} \emph{Result: higher peak performance.}
-Agent~3 beats Agent~1 $7\text{-}1\text{-}2$ despite using identical shaping, because a policy trained only against random opponents has a narrow occupancy distribution that is partly off-support against CEIA defense. Stages~1--2 shift training toward that distribution, Stage~3 keeps it expanding. Fig.~\ref{fig:training}d shows the expected staircase: win rate drops at each stage advance and recovers. Curriculum~v1 failed for an architectural reason: with a single shared \texttt{opponent} policy, weight swaps mid-run require copying tensors through every Ray worker, but our naive callback only updated the driver's copy. The fix is to declare all three opponent policies up front and route each agent ID through \texttt{policy\_mapping\_fn} from a worker-shared stage file.
+\textbf{The curriculum improved the final policy, but only after we fixed the opponent-mapping design.}
+The clearest evidence is the head-to-head record against Agent~1: LUCKETS wins $7$, loses $1$, draws $2$, despite both agents using the same shaping.
+We think this helps because of distribution shift.
+A policy trained only against random opponents converges to a narrow set of states; the CEIA baseline's ball-approach patterns and defensive positions are partly off that distribution.
+Stages~1--2 move training toward those patterns, and Stage~3 keeps the distribution expanding as the policy improves.
+Figure~\ref{fig:training}d shows the staircase we expected: win rate drops at every stage advance and then recovers.
 
-\textbf{Pure self-play failure.}
-Without shaping, no player generates a scoring trajectory early enough to provide a gradient; both sides converge on a trivial idle strategy with zero goals, entropy collapses, and rotating snapshots cannot perturb the fixed point because the reward signal for escaping it is identically zero.
+\textbf{The first curriculum failed for a practical implementation reason, not a methodological one.}
+The win rate looked strong, but the agent never actually left Stage~$0$.
+The promotion rule fired correctly; the problem was that the opponent policy used by the Ray workers did not change.
+With a single shared \texttt{opponent} policy, weight swaps at runtime require copying tensors into every worker's local config, and our callback only mutated the driver's copy.
+This was misleading at first because the training metrics looked exactly like a successful curriculum.
+The fix in Phase~4 is structural: by declaring all three opponent policies up front, the swap is just a routing change in \texttt{policy\_mapping\_fn} rather than mid-training tensor mutation.
 
-\textbf{Limitations.} Both agents stop at $8/10$ vs.\ CEIA, not a decisive $9/10$; the two Agent~3 losses suggest over-committing on offense. Shaping ignores teammate position, so no passing incentive is learned. A symmetric demotion rule (promote at $\ge 0.8$, demote at $\le 0.4$) is the most likely next improvement.
+\textbf{Pure self-play failed because there was no gradient to bootstrap from.}
+Without shaping, neither side generates a scoring trajectory early enough to provide a learning signal.
+Both teams converge on idle behaviour with zero goals, entropy collapses, and rotating frozen snapshots cannot perturb the fixed point because the reward signal for escaping it is exactly zero.
+Reward shaping provides the bootstrap.
+The curriculum gives that bootstrap a useful target to grow toward.
+
+\textbf{Limitations.}
+Both shaped agents stop at $8/10$ against CEIA, not $9/10$.
+Agent~1 turns its two losses into draws instead, which suggests LUCKETS is more aggressive in a way that wins more head-to-heads but occasionally costs a goal against a strong defender.
+Shaping also ignores teammate position, so there is no passing incentive.
+A symmetric promotion/demotion rule (advance at $\ge 0.8$, retreat at $\le 0.4$) is the most natural next step.
 
 %===============================================================================
 \acknowledgments{We thank the course staff for the SoccerTwos starter kit~\citep{Oliveira2021SoccerTwos} and the CEIA baseline, and the Georgia Tech PACE team for cluster access.}
