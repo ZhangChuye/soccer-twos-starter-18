@@ -145,3 +145,15 @@ Luckets_agent_old/
 curriculum_agent/
 final_selfplay copy/
 final_selfplay/
+
+# Large derived/template files
+report/curriculum_full.csv
+corl_2026_template_cameraready/
+
+# Old/unused training plots (regenerable via report/make_plots.py)
+report/training_curriculum.png
+report/training_per_agent.png
+report/training_reward_shaped.png
+report/training_selfplay.png
+report/comparison.png
+report/luckets_curve.png
